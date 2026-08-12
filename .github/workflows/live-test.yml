@@ -1,0 +1,488 @@
+name: Live Test (Azure CLI PR)
+run-name: Live Test (PR ${{ inputs.pr_number }} @ ${{ inputs.pr_head_sha || 'auto' }})
+
+# Triggered remotely by the agent-assist Tester agent via:
+#   POST /repos/Azure/issue-sentinel/actions/workflows/live-test.yml/dispatches
+#
+# Runs `azdev test {module} --live --series` against an in-flight PR on
+# Azure/azure-cli using BAMI-tenant credentials (federated via OIDC), and
+# posts the result back as a PR comment.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number on Azure/azure-cli"
+        required: true
+        type: string
+      module:
+        description: "Optional advisory module/extension name (no longer used for selection; tests are derived from changed test files). Kept for backward compatibility."
+        required: false
+        type: string
+        default: ""
+      target_kind:
+        description: "Whether the PR targets a core module or an azure-cli-extensions extension (used only to decide azdev setup flags)."
+        required: false
+        type: choice
+        options:
+          - module
+          - extension
+        default: module
+      repo:
+        description: "owner/repo of the PR (Azure/azure-cli or Azure/azure-cli-extensions)"
+        required: false
+        type: string
+        default: "Azure/azure-cli"
+      pr_head_sha:
+        description: "PR head SHA observed by dispatcher (optional, for dedupe/traceability)"
+        required: false
+        type: string
+        default: ""
+      post_comment:
+        description: "Post result back to the PR as a comment"
+        required: false
+        type: boolean
+        default: true
+      commit_recordings:
+        description: "Commit regenerated live-test recordings back to the PR head branch (same-repo branches only)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write       # required for federated OIDC login to BAMI
+  contents: read
+  pull-requests: write  # required to comment back on the PR
+
+concurrency:
+  group: live-test-${{ inputs.repo }}-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  live-test:
+    name: azdev test --live (PR ${{ inputs.pr_number }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      PR_REPO: ${{ inputs.repo }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+
+    steps:
+      - name: Azure login (SDK Infrastructure, federated OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURESDK_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURESDK_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURESDK_SUBSCRIPTION_ID }}
+
+      - name: Fetch PAT from Key Vault
+        id: kv
+        run: |
+          set -euo pipefail
+          pat=$(az keyvault secret show \
+            --vault-name azclibotfinegrainedpat \
+            --name azclibot-pat \
+            --query value -o tsv)
+          echo "::add-mask::${pat}"
+          echo "pat=${pat}" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (BAMI tenant, federated OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.BAMI_CLIENT_ID }}
+          tenant-id:       ${{ secrets.BAMI_TENANT_ID }}
+          subscription-id: ${{ secrets.BAMI_SUBSCRIPTION_ID }}
+          allow-no-subscriptions: false
+
+      - name: Resolve PR head SHA
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.kv.outputs.pat }}
+        run: |
+          set -euo pipefail
+          owner="${PR_REPO%/*}"
+          repo="${PR_REPO#*/}"
+          pr_json=$(gh api "repos/${owner}/${repo}/pulls/${PR_NUMBER}")
+          head_sha=$(echo "$pr_json" | jq -r .head.sha)
+          head_ref=$(echo "$pr_json" | jq -r .head.ref)
+          base_ref=$(echo "$pr_json" | jq -r .base.ref)
+          head_repo=$(echo "$pr_json" | jq -r .head.repo.full_name)
+          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
+          echo "head_ref=${head_ref}" >> "$GITHUB_OUTPUT"
+          echo "base_ref=${base_ref}" >> "$GITHUB_OUTPUT"
+          echo "head_repo=${head_repo}" >> "$GITHUB_OUTPUT"
+          echo "owner=${owner}"       >> "$GITHUB_OUTPUT"
+          echo "repo=${repo}"         >> "$GITHUB_OUTPUT"
+
+      - name: Log resolved PR refs
+        run: |
+          set -euo pipefail
+          echo "Resolved PR target: ${{ steps.pr.outputs.owner }}/${{ steps.pr.outputs.repo }}#${{ inputs.pr_number }}"
+          echo "PR head ref: ${{ steps.pr.outputs.head_ref }}"
+          echo "PR head sha: ${{ steps.pr.outputs.head_sha }}"
+          echo "PR base ref: ${{ steps.pr.outputs.base_ref }}"
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pr.outputs.owner }}/${{ steps.pr.outputs.repo }}
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+          path: ${{ steps.pr.outputs.repo }}
+
+      - name: Checkout companion repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pr.outputs.repo == 'azure-cli' && 'Azure/azure-cli-extensions' || 'Azure/azure-cli' }}
+          ref: ${{ steps.pr.outputs.repo == 'azure-cli' && 'main' || 'dev' }}
+          fetch-depth: 1
+          path: ${{ steps.pr.outputs.repo == 'azure-cli' && 'azure-cli-extensions' || 'azure-cli' }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Resolve changed test files
+        id: detect
+        env:
+          PR_REPO_NAME: ${{ steps.pr.outputs.repo }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          cd "$PR_REPO_NAME"
+          git fetch origin "${BASE_REF}" --depth=200 || true
+
+          # All changed test files in the PR (added / copied / modified / renamed).
+          # A "test file" is a test_*.py living under a tests/ directory.
+          changed=$(git diff --name-only --diff-filter=ACMR "origin/${BASE_REF}...HEAD" || true)
+          test_files=$(echo "$changed" | grep -E '(^|/)tests/.*/?test_[^/]*\.py$' || true)
+
+          # Only files that still exist on the PR head (a renamed-away path won't).
+          existing=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ -f "$f" ] && existing="${existing}${f}"$'\n'
+          done <<< "$test_files"
+          test_files="$existing"
+
+          # Unique pytest selectors: bare test-file stems (azdev matches on filename).
+          stems=$(echo "$test_files" | sed '/^$/d' | xargs -n1 basename 2>/dev/null \
+            | sed 's/\.py$//' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+
+          # Newly-added test files (for reporting).
+          new_files=$(git diff --name-only --diff-filter=A "origin/${BASE_REF}...HEAD" \
+            | grep -E '(^|/)tests/.*/?test_[^/]*\.py$' || true)
+
+          # Decide azdev setup flags. Extensions must be installed by name so azdev
+          # can discover their tests; core modules are all available after a plain setup.
+          if [ "$PR_REPO_NAME" = "azure-cli-extensions" ]; then
+            kind="extension"
+            ext=$(echo "$test_files" | awk -F/ '$1=="src"{print $2}' | sort -u | head -1)
+          else
+            kind="module"
+            ext=""
+          fi
+
+          if [ -z "$stems" ]; then
+            echo "has_tests=false" >> "$GITHUB_OUTPUT"
+            echo "No changed test files detected — nothing to live-test."
+          else
+            echo "has_tests=true" >> "$GITHUB_OUTPUT"
+            echo "Changed test files:"
+            echo "$test_files"
+            echo "Selectors: $stems"
+          fi
+          echo "kind=${kind}" >> "$GITHUB_OUTPUT"
+          echo "ext=${ext}" >> "$GITHUB_OUTPUT"
+          echo "stems=${stems}" >> "$GITHUB_OUTPUT"
+          if [ -n "$new_files" ]; then
+            echo "has_new_tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_new_tests=false" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "new_list<<EOF"
+            echo "$new_files"
+            echo "EOF"
+            echo "files_list<<EOF"
+            echo "$test_files"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install azdev and Azure CLI from source
+        if: steps.detect.outputs.has_tests == 'true'
+        env:
+          KIND: ${{ steps.detect.outputs.kind }}
+          EXT: ${{ steps.detect.outputs.ext }}
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install azdev
+          if [ "$KIND" = "extension" ] && [ -n "$EXT" ]; then
+            azdev setup -c azure-cli -r azure-cli-extensions -e "$EXT"
+          else
+            azdev setup -c azure-cli
+          fi
+
+      - name: Run azdev test (live, series) — changed test files only
+        id: test
+        if: steps.detect.outputs.has_tests == 'true'
+        env:
+          STEMS: ${{ steps.detect.outputs.stems }}
+          KIND: ${{ steps.detect.outputs.kind }}
+        run: |
+          source .venv/bin/activate
+          set -o pipefail
+          mkdir -p test-output
+          # Build a fresh discovery index so bare test-file stems resolve, then run
+          # only the changed test files live.
+          set +e
+          azdev test $STEMS --live --series --discover \
+            --xml-path test-output/results.xml \
+            2>&1 | tee test-output/log.txt
+          rc=$?
+          set -e
+          ran=true
+          if [ ! -s test-output/results.xml ] || ! grep -q '<testcase' test-output/results.xml; then
+            ran=false
+            if [ "$rc" = "0" ]; then
+              echo "::error::azdev selected 0 tests from changed files [$STEMS] — discovery may have failed (new file not indexed, or extension not installed)."
+              rc=2
+            fi
+          fi
+          echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"
+          echo "ran_tests=${ran}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Collect live-test recordings
+        id: rec
+        if: always() && steps.detect.outputs.has_tests == 'true'
+        env:
+          PR_REPO_NAME: ${{ steps.pr.outputs.repo }}
+        run: |
+          set -euo pipefail
+          cd "$PR_REPO_NAME"
+          mkdir -p ../test-output/recordings
+          # `azdev test --live` regenerates VCR cassettes in place under
+          # **/tests/**/recordings/*.yaml. Capture the ones this run changed
+          # (modified or newly added) so they can be archived and pushed.
+          changed=$(git status --porcelain \
+            | awk '{print $2}' \
+            | grep -E '/recordings/.*\.yaml$' || true)
+          count=0
+          if [ -n "$changed" ]; then
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              dest="../test-output/recordings/${f}"
+              mkdir -p "$(dirname "$dest")"
+              cp "$f" "$dest"
+              count=$((count + 1))
+            done <<< "$changed"
+          fi
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          {
+            echo "files<<EOF"
+            echo "$changed"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Collected ${count} changed recording file(s) into test-output/recordings/."
+
+      - name: Commit recordings to PR branch
+        id: push
+        if: >-
+          always()
+          && steps.detect.outputs.has_tests == 'true'
+          && inputs.commit_recordings == true
+          && steps.rec.outputs.count != '0'
+          && steps.test.outputs.exit_code == '0'
+          && steps.pr.outputs.head_repo == inputs.repo
+        env:
+          PR_REPO_NAME: ${{ steps.pr.outputs.repo }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          OWNER: ${{ steps.pr.outputs.owner }}
+          REPO: ${{ steps.pr.outputs.repo }}
+          PAT: ${{ steps.kv.outputs.pat }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          cd "$PR_REPO_NAME"
+          files=$(git status --porcelain \
+            | awk '{print $2}' \
+            | grep -E '/recordings/.*\.yaml$' || true)
+          if [ -z "$files" ]; then
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            echo "No recording changes to commit."
+            exit 0
+          fi
+          git config user.name "azclibot"
+          git config user.email "azclibot@users.noreply.github.com"
+          echo "$files" | xargs git add --
+          if git diff --cached --quiet; then
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing staged after add."
+            exit 0
+          fi
+          git commit -m "Update live-test recordings from azdev --live" \
+            -m "Regenerated by the agent-assist live-test workflow. Run: ${RUN_URL}" >/dev/null
+          sha=$(git rev-parse HEAD)
+          # Push with the azclibot token (installation token has contents:write).
+          git remote set-url origin "https://x-access-token:${PAT}@github.com/${OWNER}/${REPO}.git"
+          if git push origin "HEAD:${HEAD_REF}"; then
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+            echo "commit_sha=${sha}" >> "$GITHUB_OUTPUT"
+            echo "Pushed recordings commit ${sha} to ${OWNER}/${REPO}:${HEAD_REF}."
+          else
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Failed to push recordings to ${HEAD_REF} (branch may have moved or be protected)."
+          fi
+
+      - name: Upload test artifacts
+        if: always() && steps.detect.outputs.has_tests == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-test-pr-${{ inputs.pr_number }}
+          path: test-output/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Build PR comment body
+        if: always() && inputs.post_comment == true
+        id: body
+        env:
+          HAS_TESTS: ${{ steps.detect.outputs.has_tests }}
+          STEMS: ${{ steps.detect.outputs.stems }}
+          KIND: ${{ steps.detect.outputs.kind }}
+          EXIT_CODE: ${{ steps.test.outputs.exit_code }}
+          RAN_TESTS: ${{ steps.test.outputs.ran_tests }}
+          NEW_TESTS: ${{ steps.detect.outputs.has_new_tests }}
+          NEW_TESTS_LIST: ${{ steps.detect.outputs.new_list }}
+          CHANGED_TESTS_LIST: ${{ steps.detect.outputs.files_list }}
+          PR_HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          PR_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          HEAD_REPO: ${{ steps.pr.outputs.head_repo }}
+          REC_COUNT: ${{ steps.rec.outputs.count }}
+          REC_FILES: ${{ steps.rec.outputs.files }}
+          REC_COMMITTED: ${{ steps.push.outputs.committed }}
+          REC_COMMIT_SHA: ${{ steps.push.outputs.commit_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "${HAS_TESTS}" != "true" ]; then
+            {
+              echo "## Live test results — changed test files only"
+              echo
+              echo "⏭️ **SKIPPED** — this PR changes no test files (\`tests/**/test_*.py\`), so there is nothing to live-test."
+              echo
+              echo "**PR head ref:** \`${PR_HEAD_REF}\`"
+              echo "**PR head sha:** \`${PR_HEAD_SHA}\`"
+              echo "**PR base ref:** \`${PR_BASE_REF}\`"
+              echo
+              echo "**Workflow run:** ${RUN_URL}"
+              echo
+              echo "_Posted by [agent-assist](https://github.com/Azure/issue-sentinel/blob/main/.github/workflows/live-test.yml) live-test workflow._"
+            } > comment.md
+            echo "path=comment.md" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${EXIT_CODE}" = "0" ]; then
+            status="✅ **PASS**"
+          elif [ "${RAN_TESTS}" = "false" ]; then
+            status="⚠️ **NO TESTS SELECTED** — changed test files did not resolve to runnable tests"
+          else
+            status="❌ **FAIL** (exit ${EXIT_CODE})"
+          fi
+          tail_log=$(tail -n 80 test-output/log.txt 2>/dev/null || echo "(no log captured)")
+          {
+            echo "## Live test results — \`azdev test --live --series\` (changed test files only)"
+            echo
+            echo "${status}"
+            echo
+            echo "**Selectors:** \`${STEMS}\` (${KIND})"
+            echo "**PR head ref:** \`${PR_HEAD_REF}\`"
+            echo "**PR head sha:** \`${PR_HEAD_SHA}\`"
+            echo "**PR base ref:** \`${PR_BASE_REF}\`"
+            echo "**New test files in PR:** ${NEW_TESTS}"
+            echo
+            echo "<details><summary>Changed test files run</summary>"
+            echo
+            echo '```'
+            echo "${CHANGED_TESTS_LIST}"
+            echo '```'
+            echo
+            echo "</details>"
+            if [ "${NEW_TESTS}" = "true" ]; then
+              echo
+              echo "<details><summary>New test files</summary>"
+              echo
+              echo '```'
+              echo "${NEW_TESTS_LIST}"
+              echo '```'
+              echo
+              echo "</details>"
+            fi
+            echo
+            echo "**Workflow run:** ${RUN_URL}"
+            if [ "${REC_COUNT:-0}" != "0" ]; then
+              echo
+              echo "**Live-test recordings:** ${REC_COUNT} regenerated — archived in workflow artifact \`live-test-pr-${PR_NUMBER}\` (\`recordings/\`)."
+              if [ "${REC_COMMITTED}" = "true" ]; then
+                echo "> ✅ Committed to \`${PR_HEAD_REF}\` as \`${REC_COMMIT_SHA}\` so CI playback uses the fresh recording."
+              elif [ "${HEAD_REPO}" != "${PR_REPO}" ]; then
+                echo "> ℹ️ This PR is from a fork, so recordings were not pushed automatically. Download them from the artifact and commit to your branch."
+              fi
+              echo
+              echo "<details><summary>Recording files</summary>"
+              echo
+              echo '```'
+              echo "${REC_FILES}"
+              echo '```'
+              echo
+              echo "</details>"
+            fi
+            echo
+            echo "<details><summary>Last 80 lines of azdev output</summary>"
+            echo
+            echo '```'
+            echo "${tail_log}"
+            echo '```'
+            echo
+            echo "</details>"
+            echo
+            echo "_Posted by [agent-assist](https://github.com/Azure/issue-sentinel/blob/main/.github/workflows/live-test.yml) live-test workflow._"
+          } > comment.md
+          echo "path=comment.md" >> "$GITHUB_OUTPUT"
+
+      - name: Post comment back to PR
+        if: always() && inputs.post_comment == true
+        env:
+          GH_TOKEN: ${{ steps.kv.outputs.pat }}
+        run: |
+          set -euo pipefail
+          gh api -X POST \
+            "repos/${PR_REPO}/issues/${PR_NUMBER}/comments" \
+            -F body=@${{ steps.body.outputs.path }} >/dev/null
+          echo "Comment posted to ${PR_REPO}#${PR_NUMBER}"
+
+      - name: Set workflow conclusion
+        if: always()
+        env:
+          HAS_TESTS: ${{ steps.detect.outputs.has_tests }}
+          EXIT_CODE: ${{ steps.test.outputs.exit_code }}
+        run: |
+          if [ "${HAS_TESTS}" != "true" ]; then
+            echo "No changed test files — skipping live test (neutral)."
+            exit 0
+          fi
+          if [ "${EXIT_CODE}" = "0" ]; then
+            echo "azdev tests passed."
+            exit 0
+          else
+            echo "azdev tests failed (exit ${EXIT_CODE})."
+            exit 1
+          fi
